@@ -34,4 +34,14 @@ module.exports = {
 
   // 演示用鉴权：token 签名密钥（生产环境务必替换）
   authSecret: process.env.AUTH_SECRET || 'dev-secret-change-me',
+
+  // 消息审核（能力默认开启，但默认处置模式为 off —— 不发布规则时行为与原版完全一致）
+  moderationEnabled: process.env.MODERATION_ENABLED !== '0',
+  modDefaultMode: process.env.MOD_DEFAULT_MODE || 'off', // pre(先审后发) / post(先发后撤) / flag(仅标记) / off
+  modDetectTimeoutMs: Number(process.env.MOD_DETECT_TIMEOUT_MS || 800), // 检测服务超时阈值，超时 fail-open
+  modFreqWindowMs: Number(process.env.MOD_FREQ_WINDOW_MS || 10_000), // 频率异常统计窗口
+  modFreqMaxCount: Number(process.env.MOD_FREQ_MAX_COUNT || 8), // 窗口内最大允许条数，超过判刷屏
+  modSensitiveWords: (process.env.MOD_SENSITIVE_WORDS || '')
+    .split(',').map((s) => s.trim()).filter(Boolean),
+  modQueueLimit: Number(process.env.MOD_QUEUE_LIMIT || 100), // 审核队列/日志单次拉取上限
 };

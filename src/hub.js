@@ -137,6 +137,21 @@ class Hub {
     return [...new Set([...set].map((c) => c.userId))];
   }
 
+  /** 房间内所有连接的快照（审核通知管理员用） */
+  roomConns(roomId) {
+    const set = this.byRoom.get(roomId);
+    return set ? [...set] : [];
+  }
+
+  /** 向某用户的所有在线连接（多端）发送同一帧，返回送达连接数 */
+  sendToUser(userId, frame, opts = {}) {
+    const mine = this.byUser.get(userId);
+    if (!mine) return 0;
+    let n = 0;
+    for (const conn of [...mine]) if (this.send(conn, frame, opts)) n++;
+    return n;
+  }
+
   /**
    * 发送单帧到指定连接。track=true 时登记未 ACK 追踪（用于 msg 类帧）。
    * 背压：未确认积压超过上限时断开连接（客户端重连后走 sync 补发）。

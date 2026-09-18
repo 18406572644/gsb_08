@@ -27,10 +27,37 @@
   .msg.mine { background: #2f6fed; align-self: flex-end; }
   .msg .meta { font-size: 11px; opacity: .65; margin-bottom: 2px; }
   .msg .tick { font-size: 11px; opacity: .7; }
+  .msg.flagged { outline: 1px solid #f0b429; }
+  .msg .risk { font-size: 11px; color: #f0b429; margin-top: 2px; }
+  .msg.recalled, .msg.blocked { background: #2a2024; color: #8a7a80; font-style: italic; opacity: .8; }
+  .msg.pending { opacity: .55; }
+  .msg .acts { margin-top: 6px; display: flex; gap: 6px; }
+  .msg .acts button { padding: 2px 8px; font-size: 11px; background: #33405f; border-color: #33405f; color: #cfd8ee; }
   .sys { align-self: center; font-size: 12px; color: #7f8db3; }
   #composer { display: flex; gap: 8px; padding: 12px 16px; background: #161d2e; }
   #composer input { flex: 1; }
-  #members { width: 200px; background: #161d2e; padding: 12px; overflow-y: auto; }
+  #members { width: 260px; background: #161d2e; padding: 12px; overflow-y: auto; }
+  #modTabs .tab { padding: 4px 8px; font-size: 12px; background: #24304d; border-color: #24304d; color: #aebbd8; }
+  #modTabs .tab.active { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  .pane { display: flex; flex-direction: column; gap: 8px; }
+  .qitem { background: #1c2539; border-radius: 8px; padding: 8px; font-size: 12px; }
+  .qitem .top { display: flex; justify-content: space-between; gap: 6px; color: #8fa0c4; margin-bottom: 4px; }
+  .qitem .content { color: #dde3f0; word-break: break-word; }
+  .qitem .hits { color: #f0b429; margin-top: 4px; }
+  .qitem .rowbtn { display: flex; gap: 6px; margin-top: 6px; }
+  .qitem .rowbtn button { padding: 3px 8px; font-size: 11px; }
+  .qitem button.approve { background: #2e9e5b; border-color: #2e9e5b; }
+  .qitem button.reject { background: #c0492f; border-color: #c0492f; }
+  .qitem button.recall { background: #8a6d1d; border-color: #8a6d1d; }
+  .tagpill { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: #33405f; color: #cdd8f2; }
+  .tagpill.violation { background: #5a2222; color: #ffb4b4; }
+  .tagpill.suspect { background: #5a4a1d; color: #ffe2a0; }
+  .rulebox textarea, .rulebox input, .rulebox select { width: 100%; margin-bottom: 6px; }
+  .rulebox textarea { min-height: 60px; resize: vertical; }
+  .ver { font-size: 11px; color: #9fb0d4; padding: 3px 0; border-bottom: 1px solid #222c44; display: flex; justify-content: space-between; gap: 6px; }
+  .ver button { padding: 1px 6px; font-size: 10px; }
+  .auditline { font-size: 11px; color: #9fb0d4; padding: 3px 0; border-bottom: 1px solid #222c44; }
+  .auditline b { color: #cfd8ee; }
   #members .m { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 13px; }
   #members .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
   #members .dot.on { background: #3ecf6e; }
@@ -71,7 +98,20 @@
     </form>
   </div>
 
-  <div id="members" class="hidden"></div>
+  <div id="members" class="hidden">
+    <div id="modTabs" style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px">
+      <button data-tab="members" class="tab active">成员</button>
+      <button data-tab="queue" class="tab admin-only">审核</button>
+      <button data-tab="appeals" class="tab admin-only">申诉</button>
+      <button data-tab="rules" class="tab admin-only">规则</button>
+      <button data-tab="audit" class="tab admin-only">日志</button>
+    </div>
+    <div id="pane-members"></div>
+    <div id="pane-queue" class="pane hidden"></div>
+    <div id="pane-appeals" class="pane hidden"></div>
+    <div id="pane-rules" class="pane hidden"></div>
+    <div id="pane-audit" class="pane hidden"></div>
+  </div>
 </main>
 
 <script>
@@ -84,9 +124,57 @@
  * - lastSeenSeq 存 localStorage，刷新页面也不丢进度。
  */
 const $ = (id) => document.getElementById(id);
-let ws = null, me = null, currentRoom = null;
-const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
+let ws = null, me = null, currentRoom = null, currentTab = 'members';
+const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], bySeq:Map, pending:Map}
 let reconnectDelay = 500, ackTimer = null, retryTimer = null;
+
+/** 晚到帧缓存：审核结果（mod_update/recall）可能先于它对应的 msg 到达，先存起来待合并 */
+const lateCache = {
+  map: new Map(),
+  key(roomId, seq) { return this.map.get(roomId + ':' + seq) || null; },
+  put(roomId, seq, data) { this.map.set(roomId + ':' + seq, data); },
+  drop(roomId, seq) { this.map.delete(roomId + ':' + seq); },
+};
+
+/**
+ * 按 seq 幂等并入消息（审核引入墓碑/状态翻转后，同一 seq 可能以不同帧多次到达）。
+ * 保留乐观插入（clientMsgId）合并，维护 bySeq 索引。
+ */
+function upsertSeqMessage(r, m, mine) {
+  const existing = r.bySeq.get(m.seq);
+  if (existing) {
+    Object.assign(existing, m, { mine: existing.mine || mine, content: m.content ?? existing.content });
+    // 真实 msg 帧（带正文）代表当前可见态：显式以帧上的 mod 为准（无 mod 即清除标记/墓碑）
+    if (m.content !== undefined) {
+      existing.mod = m.mod || null;
+      existing.modReason = m.modReason || null;
+    }
+    return existing;
+  }
+  // 与自己乐观插入的占位合并
+  const ownIdx = m.clientMsgId ? r.msgs.findIndex((x) => x.clientMsgId === m.clientMsgId) : -1;
+  let entry;
+  if (ownIdx >= 0) {
+    entry = { ...r.msgs[ownIdx], ...m, mine: true, pending: false };
+    r.msgs[ownIdx] = entry;
+    r.pending.delete(m.clientMsgId);
+  } else {
+    entry = { ...m, mine: !!mine };
+    // 在「有数字 seq 的消息」之间按序插入；sys 提示与乐观占位（seq='…'）保持原位
+    let idx = r.msgs.length;
+    for (let i = 0; i < r.msgs.length; i++) {
+      const x = r.msgs[i];
+      if (!x.sys && typeof x.seq === 'number' && x.seq > entry.seq) { idx = i; break; }
+    }
+    r.msgs.splice(idx, 0, entry);
+  }
+  r.bySeq.set(m.seq, entry);
+  if (r.msgs.length > 500) {
+    const removed = r.msgs.splice(0, r.msgs.length - 500);
+    for (const x of removed) if (x.seq != null && r.bySeq.get(x.seq) === x) r.bySeq.delete(x.seq);
+  }
+  return entry;
+}
 
 const store = {
   key: () => 'chat:' + me.name,
@@ -137,31 +225,100 @@ function handle(m) {
     case 'welcome': break;
     case 'joined': {
       const saved = store.load();
-      const r = rooms.get(m.roomId) || { msgs: [], pending: new Map(), lastSeenSeq: 0 };
+      const r = rooms.get(m.roomId) || { msgs: [], bySeq: new Map(), pending: new Map(), lastSeenSeq: 0 };
+      r.bySeq = r.bySeq || new Map();
       r.name = m.name; r.role = m.role; r.mutedUntil = m.mutedUntil;
       r.lastSeenSeq = Math.max(r.lastSeenSeq, saved[m.roomId]?.lastSeenSeq || 0);
       rooms.set(m.roomId, r);
       if (!currentRoom) currentRoom = m.roomId;
-      renderRooms(); render(); refreshMembers();
+      renderRooms(); render(); refreshMembers(); refreshMod();
       break;
     }
     case 'msg': {
       const r = rooms.get(m.roomId); if (!r) break;
-      if (m.seq <= r.lastSeenSeq) break;          // 幂等消费：重复投递直接丢弃
-      r.lastSeenSeq = m.seq;
-      // 自己发的消息：广播回包更新乐观插入的占位消息，不重复上屏
-      const own = m.clientMsgId ? r.msgs.findIndex((x) => x.clientMsgId === m.clientMsgId) : -1;
-      if (own >= 0) {
-        r.msgs[own] = { ...m, mine: true, pending: false };
-        r.pending.delete(m.clientMsgId);
-      } else {
-        r.msgs.push({ ...m, mine: m.from === me.userId });
-      }
-      if (r.msgs.length > 500) r.msgs.splice(0, r.msgs.length - 500);
-      store.save(); scheduleAck();
+      // 晚到的 flagged 标记/撤回等可能先在 lateCache，待 msg 到达时合并
+      const late = lateCache.key(m.roomId, m.seq);
+      if (late) { if (late.mod) m.mod = late.mod; if (late.modReason) m.modReason = late.modReason; lateCache.drop(m.roomId, m.seq); }
+      upsertSeqMessage(r, m, m.from === me.userId);
+      if (m.seq > r.lastSeenSeq) { r.lastSeenSeq = m.seq; store.save(); }
+      // 即使 seq 已被补发游标越过（held 晚放行的实时推送），也要确认，否则服务端会重发
+      scheduleAck();
       render();
       break;
     }
+    // 审核中占位（仅发送者本人收到）
+    case 'msg_pending': {
+      const r = rooms.get(m.roomId); if (!r) break;
+      const own = m.clientMsgId ? r.msgs.findIndex((x) => x.clientMsgId === m.clientMsgId) : -1;
+      if (own >= 0) r.msgs[own] = { ...r.msgs[own], seq: m.seq, mod: 'held' };
+      else upsertSeqMessage(r, { ...m, mod: 'held', mine: true }, true);
+      r.bySeq.set(m.seq, r.msgs.find((x) => x.seq === m.seq));
+      if (m.seq > r.lastSeenSeq) { r.lastSeenSeq = m.seq; store.save(); scheduleAck(); }
+      render();
+      break;
+    }
+    // 墓碑：已撤回（补发/历史/实时）。占 seq 槽位、推进游标、不含正文
+    case 'msg_recalled':
+    case 'recall': {
+      const r = rooms.get(m.roomId); if (!r) break;
+      const existing = r.bySeq.get(m.seq);
+      if (existing) { existing.mod = 'recalled'; existing.modReason = m.reason || existing.modReason; }
+      else upsertSeqMessage(r, { seq: m.seq, roomId: m.roomId, ts: m.ts, mod: 'recalled', modReason: m.reason }, false);
+      if (m.seq > r.lastSeenSeq) { r.lastSeenSeq = m.seq; store.save(); scheduleAck(); }
+      render();
+      break;
+    }
+    // 驳回墓碑（补发时仅发送者本人收到）
+    case 'msg_blocked': {
+      const r = rooms.get(m.roomId); if (!r) break;
+      const existing = r.bySeq.get(m.seq);
+      if (existing) { existing.mod = 'rejected'; existing.modReason = m.reason || existing.modReason; }
+      else upsertSeqMessage(r, { seq: m.seq, roomId: m.roomId, ts: m.ts, mod: 'rejected', modReason: m.reason, mine: true }, true);
+      if (m.seq > r.lastSeenSeq) { r.lastSeenSeq = m.seq; store.save(); scheduleAck(); }
+      render();
+      break;
+    }
+    // 风险标记更新（flag 模式 / 解除标记）
+    case 'mod_update': {
+      const r = rooms.get(m.roomId); if (!r) break;
+      const existing = r.bySeq.get(m.seq);
+      if (existing) { existing.mod = m.mod === 'visible' ? null : m.mod; existing.modReason = m.reason || null; }
+      else lateCache.put(m.roomId, m.seq, { mod: m.mod === 'visible' ? null : m.mod, modReason: m.reason });
+      render();
+      break;
+    }
+    // 发送者收到的人工处置结果
+    case 'mod_result': {
+      const r = rooms.get(m.roomId); if (!r) break;
+      const existing = r.bySeq.get(m.seq);
+      if (existing) {
+        if (m.outcome === 'rejected') existing.mod = 'rejected';
+        else if (m.outcome === 'recalled') existing.mod = 'recalled';
+        else if (m.outcome === 'approved') existing.mod = null;
+        existing.modReason = m.reason || existing.modReason;
+      }
+      sys(m.roomId, m.outcome === 'approved' ? `消息 #${m.seq} 已通过审核`
+        : m.outcome === 'rejected' ? `消息 #${m.seq} 被驳回${m.reason ? '：' + m.reason : ''}`
+        : `消息 #${m.seq} 被撤回${m.reason ? '：' + m.reason : ''}`);
+      render();
+      break;
+    }
+    case 'appeal_result': {
+      sys(m.roomId, m.upheld ? `你对 #${m.seq} 的申诉被驳回（维持处置）` : `你对 #${m.seq} 的申诉成功，消息已恢复`);
+      break;
+    }
+    // —— 管理员实时推送 ——
+    case 'mod_queue_update': if (m.roomId === currentRoom && currentTab === 'queue') loadQueue(); break;
+    case 'mod_appeal_update': if (m.roomId === currentRoom && currentTab === 'appeals') loadAppeals(); break;
+    case 'mod_rule_changed':
+      sys(m.roomId, `审核规则已更新至 v${m.version}（${m.rule?.mode}）`);
+      if (m.roomId === currentRoom && currentTab === 'rules') loadRules();
+      break;
+    // —— 管理员面板数据 ——
+    case 'mod_queue': renderQueue(m); break;
+    case 'appeal_list': renderAppeals(m); break;
+    case 'mod_rules': renderRules(m); break;
+    case 'mod_audit': renderAudit(m); break;
     case 'ack': {                                  // 服务端确认我发的消息（含分配的 seq）
       const r = rooms.get(m.roomId); if (!r) break;
       const p = r.pending.get(m.clientMsgId);
@@ -174,6 +331,18 @@ function handle(m) {
     case 'sync_done':
       if (m.hasMore) send({ type: 'sync', roomId: m.roomId, lastSeq: m.lastSeq });
       break;
+    case 'history': {
+      const r = rooms.get(m.roomId); if (!r) break;
+      for (const x of m.messages || []) {
+        if (x.type === 'msg_recalled') {
+          if (!r.bySeq.has(x.seq)) upsertSeqMessage(r, { seq: x.seq, roomId: x.roomId, ts: x.ts, mod: 'recalled', modReason: x.reason }, false);
+        } else {
+          upsertSeqMessage(r, x, x.from === me.userId);
+        }
+      }
+      render();
+      break;
+    }
     case 'notice': {
       const r = rooms.get(m.roomId);
       if (r && m.userId === me.userId) r.mutedUntil = m.event === 'muted' ? m.until : 0;
@@ -226,7 +395,7 @@ function renderRooms() {
        <span class="badge">${r.role === 'admin' ? '管理员' : ''}</span>
      </div>`).join('');
   for (const el of $('roomList').children) {
-    el.onclick = () => { currentRoom = el.dataset.id; renderRooms(); render(); refreshMembers(); };
+    el.onclick = () => { currentRoom = el.dataset.id; renderRooms(); render(); refreshMod(); };
   }
 }
 
@@ -238,12 +407,33 @@ function render() {
   const box = $('messages');
   box.innerHTML = r.msgs.map((m) => {
     if (m.sys) return `<div class="sys">${escapeHtml(m.sys)}</div>`;
-    const tick = m.mine ? `<span class="tick">${m.pending ? '…' : '✓'}</span>` : '';
-    return `<div class="msg ${m.mine ? 'mine' : ''}">
+    // 墓碑：已撤回
+    if (m.mod === 'recalled') {
+      return `<div class="msg recalled" data-seq="${m.seq}">
+        <div class="meta">#${m.seq} · 消息已撤回${m.modReason ? '（' + escapeHtml(m.modReason) + '）' : ''}</div>
+        ${m.mine ? appealBtn(m) : ''}</div>`;
+    }
+    // 墓碑：被审核驳回（仅本人可见）
+    if (m.mod === 'rejected') {
+      return `<div class="msg blocked mine" data-seq="${m.seq}">
+        <div class="meta">#${m.seq} · 内容未通过审核${m.modReason ? '：' + escapeHtml(m.modReason) : ''}</div>
+        ${appealBtn(m)}</div>`;
+    }
+    const tick = m.mine ? `<span class="tick">${m.mod === 'held' ? '⏳审核中' : m.pending ? '…' : '✓'}</span>` : '';
+    const risk = m.mod === 'flagged' ? `<div class="risk">⚠ 风险标记${m.modReason ? '：' + escapeHtml(m.modReason) : ''}</div>` : '';
+    return `<div class="msg ${m.mine ? 'mine' : ''} ${m.mod === 'flagged' ? 'flagged' : ''} ${m.mod === 'held' ? 'pending' : ''}" data-seq="${m.seq ?? ''}">
       <div class="meta">${escapeHtml(m.fromName || '')} · #${m.seq} ${tick}</div>
-      <div>${escapeHtml(m.content)}</div></div>`;
+      <div>${escapeHtml(m.content)}</div>${risk}
+      ${(m.mod === 'recalled' || m.mod === 'flagged') && m.mine ? appealBtn(m) : ''}</div>`;
   }).join('');
   box.scrollTop = box.scrollHeight;
+  // 绑定申诉按钮
+  box.querySelectorAll('button[data-appeal]').forEach((btn) => {
+    btn.onclick = () => {
+      const reason = prompt('申诉理由（提交后由管理员复核）');
+      if (reason) send({ type: 'appeal_create', roomId: currentRoom, seq: Number(btn.dataset.appeal), reason });
+    };
+  });
   const muted = r.mutedUntil > Date.now();
   $('msgInput').placeholder = muted ? `你已被禁言至 ${new Date(r.mutedUntil).toLocaleTimeString()}` : '发送消息…';
   $('msgInput').disabled = muted;
@@ -252,7 +442,7 @@ function render() {
 // 把 members 响应接进渲染
 function renderMembers(list) {
   const r = rooms.get(currentRoom); if (!r) return;
-  $('members').innerHTML = '<b>成员</b>' + list.map((m) => {
+  $('pane-members').innerHTML = '<b>成员</b>' + list.map((m) => {
     const muted = m.mutedUntil > Date.now();
     const adminBtns = r.role === 'admin' && m.userId !== me.userId && m.role !== 'admin'
       ? (muted ? `<button data-act="unmute" data-uid="${m.userId}">解禁</button>`
@@ -263,7 +453,7 @@ function renderMembers(list) {
       ${muted ? '<span class="tag muted">禁言中</span>' : ''}
       ${adminBtns}</div>`;
   }).join('');
-  $('members').querySelectorAll('button').forEach((b) => {
+  $('pane-members').querySelectorAll('button').forEach((b) => {
     b.onclick = () => {
       if (b.dataset.act === 'mute') {
         const mins = prompt('禁言时长（分钟）', '10');
@@ -279,6 +469,134 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+function appealBtn(m) {
+  return `<div class="acts"><button data-appeal="${m.seq}">申诉</button></div>`;
+}
+
+// ------------------------------------------------ 管理员审核面板
+
+function refreshMod() {
+  const r = rooms.get(currentRoom);
+  const isAdmin = r && r.role === 'admin';
+  document.querySelectorAll('.admin-only').forEach((el) => el.classList.toggle('hidden', !isAdmin));
+  if (isAdmin) loadCurrentTab();
+  else switchTab('members');
+}
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('#modTabs .tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  ['members', 'queue', 'appeals', 'rules', 'audit'].forEach((t) => {
+    $('pane-' + t).classList.toggle('hidden', t !== tab);
+  });
+  $('pane-members').style.display = tab === 'members' ? '' : 'none';
+  loadCurrentTab();
+}
+
+function loadCurrentTab() {
+  const r = rooms.get(currentRoom); if (!r) return;
+  if (currentTab === 'members') refreshMembers();
+  else if (currentTab === 'queue') loadQueue();
+  else if (currentTab === 'appeals') loadAppeals();
+  else if (currentTab === 'rules') loadRules();
+  else if (currentTab === 'audit') loadAudit();
+}
+
+const loadQueue = () => send({ type: 'mod_queue', roomId: currentRoom });
+const loadAppeals = () => send({ type: 'appeal_list', roomId: currentRoom });
+const loadRules = () => send({ type: 'mod_rules_get', roomId: currentRoom });
+const loadAudit = () => send({ type: 'mod_audit', roomId: currentRoom });
+
+document.querySelectorAll('#modTabs .tab').forEach((b) => {
+  b.onclick = () => switchTab(b.dataset.tab);
+});
+
+function decide(seq, decision) {
+  let reason = null;
+  if (decision !== 'approve') reason = prompt('处理说明（可选）') || null;
+  send({ type: 'mod_decide', roomId: currentRoom, seq, decision, reason });
+}
+
+function renderQueue(m) {
+  const pane = $('pane-queue');
+  const item = (i) => `<div class="qitem">
+    <div class="top"><span>#${i.seq} · ${escapeHtml(i.fromName || i.from)}</span>
+      <span class="tagpill ${i.detectStatus}">${i.detectStatus}</span></div>
+    <div class="content">${escapeHtml(i.content)}</div>
+    ${(i.hits || []).length ? `<div class="hits">${i.hits.map((h) => h.word ? '敏感词:' + escapeHtml(h.word) : h.type).join('，')}</div>` : ''}
+    <div class="top" style="margin-top:4px">状态：${i.modStatus}${i.decision ? ' / 已决:' + i.decision : ''}</div>
+    ${i.decision ? '' : `<div class="rowbtn">
+      <button class="approve" onclick="decide(${i.seq},'approve')">放行</button>
+      <button class="reject" onclick="decide(${i.seq},'reject')">驳回</button>
+      <button class="recall" onclick="decide(${i.seq},'recall')">撤回</button>
+    </div>`}
+  </div>`;
+  pane.innerHTML = '<b>待人工复核</b>'
+    + (m.pending.length ? m.pending.map(item).join('') : '<div class="auditline">无待处理</div>')
+    + '<b style="margin-top:8px">最近记录</b>'
+    + m.recent.slice(0, 20).map(item).join('');
+}
+
+function renderAppeals(m) {
+  const pane = $('pane-appeals');
+  pane.innerHTML = (m.appeals.length ? m.appeals : []).map((a) => `
+    <div class="qitem">
+      <div class="top"><span>#${a.seq} · ${escapeHtml(a.userName)}</span>
+        <span class="tagpill ${a.status === 'open' ? 'suspect' : ''}">${a.status}</span></div>
+      <div class="content">${escapeHtml(a.reason)}</div>
+      ${a.reply ? `<div class="hits">回复：${escapeHtml(a.reply)}</div>` : ''}
+      ${a.status === 'open' ? `<div class="rowbtn">
+        <button class="reject" onclick="handleAppeal(${a.id},true)">维持</button>
+        <button class="approve" onclick="handleAppeal(${a.id},false)">推翻/恢复</button>
+      </div>` : ''}
+    </div>`).join('') || '<div class="auditline">暂无申诉</div>';
+}
+
+function handleAppeal(appealId, uphold) {
+  const reply = prompt('回复（可选）') || null;
+  send({ type: 'appeal_handle', roomId: currentRoom, appealId, uphold, reply });
+}
+
+function renderRules(m) {
+  const c = m.current || {};
+  const pane = $('pane-rules');
+  pane.innerHTML = `<div class="rulebox">
+    <b>发布新规则版本（当前 v${c.version ?? 0}，模式 ${c.mode || 'off'}）</b>
+    <select id="rMode">
+      ${['off', 'pre', 'post', 'flag'].map((x) => `<option value="${x}" ${c.mode === x ? 'selected' : ''}>${x}</option>`).join('')}
+    </select>
+    <input id="rWords" placeholder="敏感词，逗号分隔" value="${escapeHtml((c.sensitiveWords || []).join(','))}">
+    <input id="rFreqMax" type="number" placeholder="窗口内最大条数" value="${c.freqMaxCount ?? ''}">
+    <input id="rTimeout" type="number" placeholder="检测超时 ms" value="${c.detectTimeoutMs ?? ''}">
+    <button onclick="publishRuleUI()">发布新版本</button>
+  </div>
+  <b>历史版本</b>
+  <div>${(m.versions || []).map((v) => `
+    <div class="ver"><span>v${v.version} · ${v.config.mode}${v.published ? ' · ✅生效中' : ''}</span>
+      ${v.published ? '' : `<button onclick="rollbackRule(${v.version})">回滚到此版</button>`}</div>`).join('')}</div>`;
+}
+
+function publishRuleUI() {
+  const words = $('rWords').value.split(',').map((s) => s.trim()).filter(Boolean);
+  const patch = { mode: $('rMode').value, sensitiveWords: words };
+  const fmax = Number($('rFreqMax').value); if (Number.isFinite(fmax) && fmax > 0) patch.freqMaxCount = fmax;
+  const t = Number($('rTimeout').value); if (Number.isFinite(t) && t > 0) patch.detectTimeoutMs = t;
+  send({ type: 'mod_rules_publish', roomId: currentRoom, ...patch });
+}
+
+function rollbackRule(version) {
+  if (confirm(`回滚到 v${version}？将生成一个新版本。`)) {
+    send({ type: 'mod_rules_rollback', roomId: currentRoom, version });
+  }
+}
+
+function renderAudit(m) {
+  $('pane-audit').innerHTML = '<b>管理员操作日志</b>' + (m.entries || []).map((e) => `
+    <div class="auditline"><b>${escapeHtml(e.action)}</b> · ${e.actor_id}
+      ${e.detail ? ' · ' + escapeHtml(typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail)) : ''}
+      <div style="opacity:.6">${new Date(e.created_at).toLocaleString()}</div></div>`).join('');
+}
+
 // ---------------------------------------------------------------- 事件绑定
 
 $('loginForm').onsubmit = async (e) => {
@@ -288,7 +606,7 @@ $('loginForm').onsubmit = async (e) => {
   // 恢复房间进度
   const saved = store.load();
   for (const [id, info] of Object.entries(saved)) {
-    rooms.set(id, { name: info.name, msgs: [], pending: new Map(), lastSeenSeq: info.lastSeenSeq || 0 });
+    rooms.set(id, { name: info.name, msgs: [], bySeq: new Map(), pending: new Map(), lastSeenSeq: info.lastSeenSeq || 0 });
   }
   $('loginForm').classList.add('hidden');
   $('roomPanel').classList.remove('hidden');
