@@ -32,6 +32,21 @@ module.exports = {
   rateLimitPerSec: Number(process.env.RATE_LIMIT_PER_SEC || 10),
   rateLimitBurst: Number(process.env.RATE_LIMIT_BURST || 20),
 
+  // —— 消息审核 ——
+  reviewEnabled: (process.env.REVIEW_ENABLED ?? '1') !== '0', // 总开关
+  // 房间未单独配置策略时的默认处置模式：pre 先审后发 / post 先发后撤 / mark 仅标记
+  reviewDefaultMode: process.env.REVIEW_DEFAULT_MODE || 'post',
+  // 频率异常检测：每用户每房间滑动窗口
+  reviewFreqWindowMs: Number(process.env.REVIEW_FREQ_WINDOW_MS || 10_000),
+  reviewFreqMaxCount: Number(process.env.REVIEW_FREQ_MAX_COUNT || 8),
+  // 检测服务调用
+  reviewDetectTimeoutMs: Number(process.env.REVIEW_DETECT_TIMEOUT_MS || 800), // 超时后降级（fail-open，不阻塞主链路）
+  reviewQueueFetchLimit: Number(process.env.REVIEW_QUEUE_LIMIT || 100), // 审核队列单次拉取上限
+  reviewAppealCooldownMs: Number(process.env.REVIEW_APPEAL_COOLDOWN_MS || 60_000), // 同消息重复申诉冷却
+  // 先审后发：待审消息超过该时长自动放行（fail-open，0=关闭自动放行）
+  reviewPendingTtlMs: Number(process.env.REVIEW_PENDING_TTL_MS || 0),
+  reviewPendingSweepMs: Number(process.env.REVIEW_PENDING_SWEEP_MS || 5_000),
+
   // 演示用鉴权：token 签名密钥（生产环境务必替换）
   authSecret: process.env.AUTH_SECRET || 'dev-secret-change-me',
 };

@@ -10,17 +10,18 @@
 - **连接管理**：心跳保活、全局/单用户连接数上限、背压断开、优雅退出
 - **房间权限**：管理员 / 成员 / 禁言三种状态，管理员可禁言、解禁
 - **发送限流**：按用户令牌桶
+- **消息审核工作流**：敏感词 + 频率异常检测，三种处置模式，人工队列/复核/申诉/规则版本/操作日志
 
 ## 快速开始
 
 ```bash
 npm install
 npm start          # http://localhost:8080
-npm test           # 13 个集成测试
+npm test           # 34 个集成测试（13 个可靠投递 + 21 个审核工作流）
 ```
 
 浏览器打开 `http://localhost:8080`，用不同昵称开两个标签页即可体验（建房、发消息、
-禁言管理）。断网/刷新页面后自动重连并补发离线期间的消息。
+禁言管理、切换审核模式、审核台处理队列与申诉）。断网/刷新页面后自动重连并补发离线期间的消息与审核指令。
 
 要求 Node.js ≥ 22.13（使用内置 `node:sqlite`，唯一第三方依赖是 `ws`）。
 
@@ -28,13 +29,15 @@ npm test           # 13 个集成测试
 
 ```
 src/
-├── config.js   配置（端口、连接上限、心跳、重发、限流，均可环境变量覆盖）
-├── db.js       SQLite 持久层：schema、幂等写入、seq 分配、游标
-├── hub.js      连接注册中心：房间索引、广播、未 ACK 追踪、心跳/重发扫描
-├── server.js   HTTP + WS 服务：认证、消息路由、权限检查、限流、生命周期
-└── util.js     token 签名、帧解析等工具
-public/index.html   演示客户端（实现完整可靠投递协议）
-test/chat.test.js   集成测试（node:test）
+├── config.js     配置（端口、连接上限、心跳、重发、限流、审核，均可环境变量覆盖）
+├── db.js         SQLite 持久层：schema/迁移、幂等写入、seq 分配、游标、审核状态机、规则版本、申诉、日志
+├── detector.js   检测服务（异步）：敏感词匹配、滑动窗口频率异常、超时/故障 fail-open
+├── moderator.js  审核编排器：检测→状态机→广播联动、人工决策、申诉裁决、TTL 兜底、断线事件补发
+├── hub.js        连接注册中心：房间索引、广播、消息/审核指令双可靠通道、心跳/重发扫描
+├── server.js     HTTP + WS 服务：认证、消息路由、权限检查、限流、审核协议、生命周期
+└── util.js       token 签名、帧解析等工具
+public/index.html 演示客户端（可靠投递协议 + 审核状态展示 + 申诉 + 管理员审核台）
+test/              集成测试（node:test）
 ```
 
 ### 数据模型
@@ -44,8 +47,17 @@ test/chat.test.js   集成测试（node:test）
 | `users` | 用户（演示级 token 认证） |
 | `rooms` | 房间，`last_seq` 为房间消息序号计数器 |
 | `members` | 成员关系：`role`（admin/member）+ `muted_until`（禁言截止时间） |
-| `messages` | 消息。主键 `(room_id, seq)`；唯一键 `(room_id, sender_id, client_msg_id)` 为幂等键 |
-| `cursors` | 每用户每房间已确认游标 `last_ack_seq`，断线补发的服务端兜底依据 |
+| `messages` | 消息。主键 `(room_id, seq)`；幂等键 `(room_id, sender_id, client_msg_id)`；审核字段 `review_status/flags/reason/rule_version/...` |
+| `cursors` | 每用户每房间消息投递游标 `last_ack_seq`（断线补发兜底） |
+| `review_cursors` | 每用户每房间**审核指令**水位 `last_event`（与投递游标独立） |
+| `review_rules` | 审核规则不可变版本（敏感词 + 频率阈值），旧版本归档不删除 |
+| `room_review_policy` | 每房间处置模式 `pre/post/mark` |
+| `review_queue` | 人工审核队列（每消息至多一个 open 条目，部分唯一索引） |
+| `review_events` | 审核事件只增日志：held/released/blocked/recalled/restored/flagged |
+| `appeals` | 用户申诉（每用户每消息一条，驳回冷却后可重新打开） |
+| `admin_log` | 管理员操作日志（只增，全链路留痕） |
+
+旧库启动时自动迁移：`messages` 追加审核列，历史消息一律视为 `released`。
 
 ## 可靠性设计
 
@@ -88,6 +100,57 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 `seq` 由 `rooms.last_seq` 在写事务内递增分配（单写者 + 事务 = 无空洞、无并发交错），
 房间内消息严格全序。客户端凭 seq 即可检测空洞并触发补发，无需依赖时钟。
 
+## 消息审核工作流
+
+### 三种处置模式（每房间可配，`review_policy`）
+
+| 模式 | 发送路径 | 检测命中 |
+|---|---|---|
+| `pre` 先审后发 | 落库→ACK→广播**无内容「审核中」占位帧**（占据 seq） | 停留 pending 入人工队列；无命中/检测降级立即放行，广播同 seq 正文帧 |
+| `post` 先发后撤（默认） | 落库→ACK→正常广播（与原链路一致） | 消息转 recalled，广播撤回帧，入人工队列（可恢复） |
+| `mark` 仅标记 | 正常广播 | 只打风险标（`msg_flagged`）并入队，可见性不变，管理员可再撤回 |
+
+### 为什么不破坏原有可靠性语义
+
+1. **ACK 机制不变**：ACK 仍在「落库事务提交后」立即回发送方。pre 模式只是暂缓*广播*，
+   消息确实已持久化，ACK 不含任何审核承诺；检测慢/挂不影响 ACK 时延。
+2. **seq 全序不变**：审核只改消息的 `review_status`，绝不删消息、绝不复用 seq。
+   每个 seq 在任何时刻都恰好对应一帧 —— 正文 / pending 占位 / blocked 占位 / recalled 占位，
+   占位帧同样推进客户端 `lastSeenSeq`，不产生空洞。
+3. **断线补发不变**：消息缺口仍按 seq 升序回放，只是按消息*当前*审核状态转帧；
+   审核指令（撤回/恢复/标记）走**第二条可靠通道** `reviewEventId`：
+   独立追踪、独立超时重发、独立累积 ACK（`ack.reviewSeq`），互不污染 seq 水位。
+   即使消息 seq 已追平，重连时仍按 `review_cursors` 补发晚到的撤回等指令。
+4. **发送幂等不变**：`clientMsgId` 重试只回原 ACK，不重复入审、不重复广播；
+   编排器另以 in-flight 去重 + DB 层 CAS 状态迁移保证同消息只调度一次检测。
+5. **检测故障 fail-open**：检测是异步 RPC（可配超时），超时/异常时 pre 自动放行、
+   post/mark 不处置，只写 `detect_degraded` 日志，绝不阻塞聊天主链路。
+
+### 异常链路覆盖
+
+- **检测超时/故障** → fail-open 降级，留痕不阻塞；
+- **误判** → 人工恢复 / 用户申诉，申诉通过联动 `recalled|blocked → released`，原 seq 恢复可见；
+- **重复审核** → 检测 in-flight 去重 + 队列部分唯一索引 + 状态迁移 CAS，重复提交幂等无副作用；
+- **消息已被人工撤回** → 晚到的检测结果只接受当前仍 `released` 的消息，不覆盖人工决策、不补入队；
+- **审核结果晚于客户端展示**（post 的撤回、pre 的放行、申诉恢复）→ 实时帧 + 断线事件补发双通道兜底；
+- **pre 积压** → `REVIEW_PENDING_TTL_MS` 定时兜底自动放行（fail-open，默认关闭）。
+
+### 审核状态机
+
+```
+                pre 落库
+ released ───────────────▶ pending ──人工/检测放行──▶ released（广播正文）
+    ▲   ▲                     │
+    │   └────人工恢复─────────┴──人工拦截──▶ blocked
+    │（申诉通过 / review_restore）             │
+    │                                        │
+    └────────────────────────────────────────┘
+ released ──post 检测命中/人工撤回──▶ recalled ──人工恢复/申诉通过──▶ released
+```
+
+所有迁移在 SQLite 事务内完成「CAS 改状态（带期望源状态）+ 关队列项 + 写 review_events」，
+并发/重复决策命中 0 行即放弃，天然幂等。
+
 ## 协议（JSON 文本帧）
 
 ### 客户端 → 服务端
@@ -99,22 +162,44 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 | `join` | `room, lastSeq?` | 加入房间（room 可为 id 或名称）；带进度则立即补发 |
 | `leave` | `roomId` | 离开房间 |
 | `msg` | `roomId, clientMsgId, content` | 发消息，回 `ack` |
-| `ack` | `roomId, seq` | 累积确认：seq 及之前均已收到 |
+| `ack` | `roomId, seq, reviewSeq?` | 累积确认：消息 seq + 审核指令 reviewEventId 两条独立水位 |
 | `sync` | `roomId, lastSeq?` | 请求补发 |
-| `history` | `roomId, beforeSeq?, limit?` | 历史翻页（升序返回） |
+| `history` | `roomId, beforeSeq?, limit?` | 历史翻页（升序返回，按审核状态转帧） |
 | `rooms` | — | 我加入的房间列表 |
 | `members` | `roomId` | 成员列表（含在线状态） |
 | `mute` | `roomId, userId, minutes` | 禁言（仅管理员，1..1440 分钟） |
 | `unmute` | `roomId, userId` | 解除禁言（仅管理员） |
+| `review_policy` | `roomId, mode?` | 查询模式；带 `mode=pre/post/mark` 为设置（仅管理员） |
+| `review_queue` | `roomId?` | 人工审核队列（房间管理员/全局管理员） |
+| `review_decide` | `roomId, seq, action, reason?` | 人工决策：`release/block/recall/restore/dismiss` |
+| `review_enqueue` | `roomId, seq` | 手动把消息加入审核队列（巡检） |
+| `review_recheck` | `roomId, seq` | 按当前最新规则只读重检（误判复核辅助） |
+| `appeal_submit` | `roomId, seq, reason` | 发送者对被处置消息申诉 |
+| `appeals_list` | `roomId?, status?` | 申诉列表（管理员） |
+| `appeal_decide` | `appealId, decision, note?` | 裁决：`approved`（联动恢复）/ `rejected` |
+| `rules_list` | `limit?` | 规则版本列表 + 当前生效版本 |
+| `rule_publish` | `words[], freqWindowMs, freqMaxCount, note?` | 发布规则新版本（任意房间管理员） |
+| `review_log` | `roomId, beforeId?` | 管理员操作日志（分页） |
 
 ### 服务端 → 客户端
 
 | 类型 | 说明 |
 |---|---|
 | `welcome` | 连接建立：`{userId, name, serverTime}` |
-| `joined` | 入房成功：`{roomId, name, role, mutedUntil, lastSeq}` |
-| `msg` | 房间消息：`{roomId, seq, clientMsgId, from, fromName, content, ts}` |
+| `joined` | 入房成功：`{roomId, name, role, mutedUntil, lastSeq, reviewMode, lastReviewEvent}` |
+| `msg` | 房间消息（正文）：`{roomId, seq, clientMsgId, from, fromName, content, ts, reviewFlags?}` |
 | `ack` | 发送确认：`{roomId, clientMsgId, seq, ts}` |
+| `msg_review` | 审核中/未通过占位帧（占 seq）：`{roomId, seq, status: pending/blocked, flags, reason, reviewEventId?}` |
+| `msg_recalled` | 先发后撤指令（reviewEventId 通道）：`{roomId, seq, flags, reason, reviewEventId}` |
+| `msg_flagged` | 仅标记风险（可见性不变）：`{roomId, seq, flags, reason, ruleVersion, reviewEventId}` |
+| `review_policy` | 房间模式变更/查询结果：`{roomId, mode}` |
+| `review_queue` | 队列响应：`{roomId, items[], total}` |
+| `review_decided` | 人工决策回执：`{roomId, seq, action, changed, idempotent, status}` |
+| `appeal_update` | 申诉状态广播：`{appeal}` |
+| `appeals` | 申诉列表响应 |
+| `rules` / `review_rule` | 规则版本列表 / 新版本发布广播 |
+| `review_recheck` | 只读重检结果（含当前规则命中与原判定规则版本对照） |
+| `review_log` | 操作日志响应：`{roomId, entries[], hasMore}` |
 | `sync_done` | 一批补发结束：`{roomId, lastSeq, hasMore}` |
 | `history` / `rooms` / `members` | 对应查询的响应 |
 | `notice` | 房间事件（`muted` / `unmuted`） |
@@ -122,7 +207,9 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 | `server_shutdown` | 服务即将关闭，请准备重连 |
 
 错误码：`BAD_FRAME` `BAD_REQUEST` `UNKNOWN_TYPE` `NOT_MEMBER` `NO_SUCH_ROOM`
-`ROOM_EXISTS` `FORBIDDEN` `MUTED` `RATE_LIMITED` `INTERNAL`；
+`ROOM_EXISTS` `FORBIDDEN` `MUTED` `RATE_LIMITED` `INTERNAL` `NOT_FOUND`
+`PENDING`（消息审核中不可申诉）`APPEAL_OPEN`（已有进行中申诉）
+`APPEAL_COOLDOWN`（申诉冷却中）`NOT_FLAGGED`（未被处置无需申诉）；
 升级阶段拒绝：`401`（认证失败）、`503 SERVER_FULL` / `503 TOO_MANY_DEVICES`。
 
 ### 连接建立
@@ -144,6 +231,14 @@ GET  /ws?token=<token>            →  WebSocket 升级
 | `ACK_RESEND_AFTER_MS` / `ACK_MAX_RESEND` | `3000` / `5` | 未 ACK 重发阈值 / 最大次数 |
 | `MAX_UNACKED_PER_CONN` | `1000` | 单连接未确认积压上限（背压） |
 | `RATE_LIMIT_PER_SEC` / `RATE_LIMIT_BURST` | `10` / `20` | 发送限流令牌桶 |
+| `REVIEW_ENABLED` | `1` | 审核总开关（`0` 关闭，消息走原链路） |
+| `REVIEW_DEFAULT_MODE` | `post` | 房间未配置时的默认模式：`pre`/`post`/`mark` |
+| `REVIEW_FREQ_WINDOW_MS` / `REVIEW_FREQ_MAX_COUNT` | `10000` / `8` | 频率异常滑动窗口与阈值 |
+| `REVIEW_DETECT_TIMEOUT_MS` | `800` | 检测服务超时（超时 fail-open，不阻塞主链路） |
+| `REVIEW_QUEUE_LIMIT` | `100` | 审核队列/申诉单次拉取上限 |
+| `REVIEW_APPEAL_COOLDOWN_MS` | `60000` | 同一消息被驳回后再次申诉的冷却 |
+| `REVIEW_PENDING_TTL_MS` | `0` | 先审后发暂存超时自动放行（`0` 关闭） |
+| `REVIEW_PENDING_SWEEP_MS` | `5000` | TTL 扫描周期 |
 | `SYNC_BATCH_SIZE` | `500` | 补发单批条数 |
 | `AUTH_SECRET` | — | token HMAC 密钥，**生产必须设置** |
 

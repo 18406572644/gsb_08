@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>可靠聊天室</title>
+<title>可靠聊天室 · 消息审核</title>
 <style>
   * { box-sizing: border-box; margin: 0; }
   body { font: 14px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -12,9 +12,12 @@
   header h1 { font-size: 16px; margin-right: auto; }
   #status { width: 10px; height: 10px; border-radius: 50%; background: #666; }
   #status.on { background: #3ecf6e; } #status.off { background: #e05252; }
-  input, button { font: inherit; padding: 7px 10px; border-radius: 6px; border: 1px solid #2a3550;
+  input, textarea, button, select { font: inherit; padding: 7px 10px; border-radius: 6px; border: 1px solid #2a3550;
                   background: #1c2539; color: inherit; }
   button { cursor: pointer; background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  button.ghost { background: transparent; color: #9fb0d8; }
+  button.warn { background: #d05a4e; border-color: #d05a4e; }
+  button.small { padding: 2px 8px; font-size: 12px; }
   button:disabled { opacity: .5; cursor: default; }
   main { flex: 1; display: flex; min-height: 0; }
   #sidebar { width: 220px; background: #161d2e; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
@@ -22,11 +25,24 @@
   #sidebar .room.active, #sidebar .room:hover { background: #24304d; }
   #sidebar .badge { color: #7f8db3; font-size: 12px; }
   #chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #chatbar { display: flex; align-items: center; gap: 8px; padding: 6px 16px; background: #141b2b; border-bottom: 1px solid #222c44; }
+  #chatbar .mode-tag { font-size: 12px; color: #9fb0d8; }
   #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 6px; }
   .msg { max-width: 70%; padding: 8px 12px; border-radius: 10px; background: #1c2539; align-self: flex-start; }
   .msg.mine { background: #2f6fed; align-self: flex-end; }
   .msg .meta { font-size: 11px; opacity: .65; margin-bottom: 2px; }
   .msg .tick { font-size: 11px; opacity: .7; }
+  .msg.pending { opacity: .75; border: 1px dashed #f0b429; }
+  .msg.blocked, .msg.recalled { opacity: .55; font-style: italic; }
+  .msg.blocked { border: 1px solid #d05a4e; }
+  .msg.recalled { border: 1px solid #7a6350; }
+  .rv-tag { display: inline-block; font-size: 10px; padding: 0 5px; border-radius: 4px; margin-left: 4px; vertical-align: 1px; }
+  .rv-tag.pending { background: #f0b429; color: #241f00; }
+  .rv-tag.blocked { background: #d05a4e; }
+  .rv-tag.recalled { background: #7a6350; }
+  .rv-tag.flagged { background: #8b5cf6; }
+  .rv-actions { margin-top: 4px; display: flex; gap: 6px; }
+  .rv-actions button { padding: 1px 7px; font-size: 11px; background: rgba(255,255,255,.14); border-color: transparent; color: inherit; }
   .sys { align-self: center; font-size: 12px; color: #7f8db3; }
   #composer { display: flex; gap: 8px; padding: 12px 16px; background: #161d2e; }
   #composer input { flex: 1; }
@@ -38,11 +54,26 @@
   #members .tag.muted { color: #e05252; }
   #members button { padding: 2px 6px; font-size: 11px; margin-left: auto; }
   .hidden { display: none !important; }
+  /* 审核台抽屉 */
+  #console { position: fixed; top: 0; right: -460px; width: 460px; max-width: 92vw; height: 100vh;
+             background: #12192a; border-left: 1px solid #2a3550; display: flex; flex-direction: column;
+             transition: right .18s ease; z-index: 20; }
+  #console.open { right: 0; }
+  #console header { padding: 12px 16px; gap: 6px; }
+  #console .tabs { display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid #222c44; }
+  #console .tabs button { background: transparent; color: #9fb0d8; border: 1px solid transparent; padding: 5px 10px; }
+  #console .tabs button.active { background: #24304d; color: #fff; }
+  #console .pane { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .card { background: #1b2438; border: 1px solid #283351; border-radius: 8px; padding: 10px; font-size: 13px; }
+  .card .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+  .card .sub { color: #8494bb; font-size: 12px; }
+  .card blockquote { border-left: 3px solid #3a486e; padding-left: 8px; margin: 4px 0; color: #c6d1ee; }
+  .card .flag { font-size: 11px; background: #8b5cf633; color: #c4a8ff; padding: 0 6px; border-radius: 4px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>可靠聊天室</h1>
+  <h1>可靠聊天室 · 消息审核</h1>
   <span id="status" class="off"></span><span id="statusText">未连接</span>
   <span id="who"></span>
 </header>
@@ -58,12 +89,20 @@
         <input id="roomInput" placeholder="房间名" maxlength="64" style="flex:1;min-width:0">
         <button type="submit">建</button>
       </form>
-      <button id="joinBtn">加入房间</button>
+      <button id="joinBtn" class="ghost">加入房间</button>
       <div id="roomList"></div>
     </div>
   </div>
 
   <div id="chat">
+    <div id="chatbar">
+      <span id="modeTag" class="mode-tag"></span>
+      <span style="flex:1"></span>
+      <button id="modePre" class="small ghost">先审后发</button>
+      <button id="modePost" class="small ghost">先发后撤</button>
+      <button id="modeMark" class="small ghost">仅标记</button>
+      <button id="consoleBtn" class="small">审核台</button>
+    </div>
     <div id="messages"></div>
     <form id="composer" class="hidden">
       <input id="msgInput" placeholder="发送消息…" autocomplete="off">
@@ -74,18 +113,38 @@
   <div id="members" class="hidden"></div>
 </main>
 
+<!-- 管理员审核台 -->
+<div id="console">
+  <header>
+    <strong style="margin-right:auto">审核台</strong>
+    <button id="consoleClose" class="ghost small">关闭</button>
+  </header>
+  <div class="tabs">
+    <button data-tab="queue" class="active">待审队列</button>
+    <button data-tab="appeals">用户申诉</button>
+    <button data-tab="rules">规则版本</button>
+    <button data-tab="log">操作日志</button>
+  </div>
+  <div class="pane" id="pane-queue"></div>
+  <div class="pane hidden" id="pane-appeals"></div>
+  <div class="pane hidden" id="pane-rules"></div>
+  <div class="pane hidden" id="pane-log"></div>
+</div>
+
 <script>
 'use strict';
-/* 可靠投递客户端协议实现：
- * - 发送：每条消息带唯一 clientMsgId，未收到 ACK 定时重发（服务端幂等去重）；
- * - 接收：按房间记录 lastSeenSeq，seq 小于等于它的一律丢弃（幂等消费）；
- * - ACK：累积确认，500ms 批量上报；
- * - 断线补发：重连后重新 join 并携带 lastSeenSeq，服务端回放缺口；
- * - lastSeenSeq 存 localStorage，刷新页面也不丢进度。
+/* 可靠投递 + 审核客户端：
+ * 消息可靠性与原实现一致（clientMsgId 重发、seq 幂等消费、累积 ACK、断线补发）。
+ * 审核扩展：
+ * - 所有带 seq 的审核帧（msg / msg_review 占位 / msg_recalled）共用 seq 去重与排序，
+ *   占位帧同样推进 lastSeenSeq —— 序号语义不因审核改变；
+ * - 审核指令（撤回/恢复/标记）带 reviewEventId，按房间独立累积 ACK（reviewSeq），
+ *   与 seq 通道互不干扰，断线后由服务端按事件水位补发；
+ * - 审核台（队列/申诉/规则/日志）仅管理员操作，普通成员可对自己被处置的消息申诉。
  */
 const $ = (id) => document.getElementById(id);
-let ws = null, me = null, currentRoom = null;
-const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
+let ws = null, me = null, currentRoom = null, consoleTab = 'queue';
+const rooms = new Map(); // roomId -> {name, role, mode, mutedUntil, lastSeenSeq, lastReviewEvent, msgs, bySeq, pending}
 let reconnectDelay = 500, ackTimer = null, retryTimer = null;
 
 const store = {
@@ -93,7 +152,7 @@ const store = {
   load() { try { return JSON.parse(localStorage.getItem(this.key())) || {}; } catch { return {}; } },
   save() {
     const o = {};
-    for (const [id, r] of rooms) o[id] = { name: r.name, lastSeenSeq: r.lastSeenSeq };
+    for (const [id, r] of rooms) o[id] = { name: r.name, lastSeenSeq: r.lastSeenSeq, lastReviewEvent: r.lastReviewEvent || 0 };
     localStorage.setItem(this.key(), JSON.stringify(o));
   },
 };
@@ -115,7 +174,6 @@ function connect() {
   ws = new WebSocket(`ws://${location.host}/ws?token=${encodeURIComponent(me.token)}`);
   ws.onopen = () => {
     setStatus('on', '已连接'); reconnectDelay = 500;
-    // 重连后恢复所有房间：携带本地进度，服务端补发缺口
     const saved = store.load();
     for (const [roomId, info] of Object.entries(saved)) {
       ws.send(JSON.stringify({ type: 'join', room: roomId, lastSeq: info.lastSeenSeq || 0 }));
@@ -132,45 +190,139 @@ function connect() {
 
 function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// ---------------------------------------------------------------- 消息条目归并
+
+/** 按 seq（或自己乐观消息的 clientMsgId）取得/创建条目，保持 seq 升序 */
+function entryFor(r, m) {
+  let e = Number.isInteger(m.seq) ? r.bySeq.get(m.seq) : null;
+  if (!e && m.clientMsgId) e = r.msgs.find((x) => x.clientMsgId === m.clientMsgId && !Number.isInteger(x.seq)) || null;
+  if (!e) {
+    e = { review: 'released' };
+    r.msgs.push(e);
+    r.bySeq instanceof Map && Number.isInteger(m.seq) && r.bySeq.set(m.seq, e);
+  } else if (Number.isInteger(m.seq)) {
+    r.bySeq.set(m.seq, e);
+  }
+  return e;
+}
+
+function sortMsgs(r) {
+  r.msgs.sort((a, b) => (Number.isInteger(a.seq) ? a.seq : 1e12) - (Number.isInteger(b.seq) ? b.seq : 1e12));
+}
+
+function applySeqFrame(r, m) {
+  if (Number.isInteger(m.seq) && m.seq <= r.lastSeenSeq && r.bySeq.has(m.seq)) {
+    // 已见过该 seq：可能是审核状态推进（占位→正文/撤回），继续合并但不重复插入
+  } else if (Number.isInteger(m.seq) && m.seq <= r.lastSeenSeq) {
+    return null;
+  }
+  const e = entryFor(r, m);
+  Object.assign(e, {
+    seq: Number.isInteger(m.seq) ? m.seq : e.seq,
+    clientMsgId: m.clientMsgId || e.clientMsgId,
+    from: m.from ?? e.from, fromName: m.fromName ?? e.fromName, ts: m.ts ?? e.ts,
+    mine: e.mine ?? (m.from === me.userId),
+    flags: m.flags || e.flags || [],
+    reason: m.reason !== undefined ? m.reason : e.reason,
+    ruleVersion: m.ruleVersion ?? m.reviewRuleVersion ?? e.ruleVersion,
+    reviewEventId: m.reviewEventId ?? e.reviewEventId,
+  });
+  return e;
+}
+
 function handle(m) {
   switch (m.type) {
     case 'welcome': break;
     case 'joined': {
       const saved = store.load();
-      const r = rooms.get(m.roomId) || { msgs: [], pending: new Map(), lastSeenSeq: 0 };
-      r.name = m.name; r.role = m.role; r.mutedUntil = m.mutedUntil;
+      const r = rooms.get(m.roomId) || { msgs: [], bySeq: new Map(), pending: new Map(), lastSeenSeq: 0, lastReviewEvent: 0 };
+      r.name = m.name; r.role = m.role; r.mutedUntil = m.mutedUntil; r.mode = m.reviewMode;
       r.lastSeenSeq = Math.max(r.lastSeenSeq, saved[m.roomId]?.lastSeenSeq || 0);
+      r.lastReviewEvent = Math.max(r.lastReviewEvent, saved[m.roomId]?.lastReviewEvent || 0, m.lastReviewEvent || 0);
       rooms.set(m.roomId, r);
       if (!currentRoom) currentRoom = m.roomId;
       renderRooms(); render(); refreshMembers();
       break;
     }
+
     case 'msg': {
       const r = rooms.get(m.roomId); if (!r) break;
-      if (m.seq <= r.lastSeenSeq) break;          // 幂等消费：重复投递直接丢弃
-      r.lastSeenSeq = m.seq;
-      // 自己发的消息：广播回包更新乐观插入的占位消息，不重复上屏
-      const own = m.clientMsgId ? r.msgs.findIndex((x) => x.clientMsgId === m.clientMsgId) : -1;
-      if (own >= 0) {
-        r.msgs[own] = { ...m, mine: true, pending: false };
-        r.pending.delete(m.clientMsgId);
-      } else {
-        r.msgs.push({ ...m, mine: m.from === me.userId });
-      }
-      if (r.msgs.length > 500) r.msgs.splice(0, r.msgs.length - 500);
-      store.save(); scheduleAck();
-      render();
+      if (Number.isInteger(m.seq) && m.seq <= r.lastSeenSeq && !r.bySeq.has(m.seq)) break;
+      const e = applySeqFrame(r, m);
+      if (!e) break;
+      e.review = (m.reviewFlags && m.reviewFlags.length) ? 'flagged' : 'released';
+      e.content = m.content;
+      e.pending = false;
+      if (m.clientMsgId) r.pending.delete(m.clientMsgId);
+      if (Number.isInteger(m.seq)) r.lastSeenSeq = Math.max(r.lastSeenSeq, m.seq);
+      if (m.reviewEventId) r.lastReviewEvent = Math.max(r.lastReviewEvent, m.reviewEventId);
+      if (r.msgs.length > 500) { r.msgs.splice(0, r.msgs.length - 500); r.bySeq = new Map(r.msgs.filter(x=>Number.isInteger(x.seq)).map(x=>[x.seq,x])); }
+      sortMsgs(r); store.save(); scheduleAck(); render();
       break;
     }
-    case 'ack': {                                  // 服务端确认我发的消息（含分配的 seq）
+
+    case 'msg_review': { // pending（审核中占位）/ blocked（未通过）
+      const r = rooms.get(m.roomId); if (!r) break;
+      if (Number.isInteger(m.seq) && m.seq <= r.lastSeenSeq && !r.bySeq.has(m.seq)) break;
+      const e = applySeqFrame(r, m);
+      if (!e) break;
+      e.review = m.status;
+      e.content = m.content ?? e.content; // pending 占位通常无 content；自己乐观消息保留本地输入
+      e.pending = m.status === 'pending';
+      if (m.clientMsgId && m.status !== 'pending') r.pending.delete(m.clientMsgId);
+      if (Number.isInteger(m.seq)) r.lastSeenSeq = Math.max(r.lastSeenSeq, m.seq);
+      if (m.reviewEventId) r.lastReviewEvent = Math.max(r.lastReviewEvent, m.reviewEventId);
+      sortMsgs(r); store.save(); scheduleAck(); render();
+      break;
+    }
+
+    case 'msg_recalled': { // 先发后撤：占据原 seq，隐藏正文
+      const r = rooms.get(m.roomId); if (!r) break;
+      const e = applySeqFrame(r, m);
+      if (!e) break;
+      e.review = 'recalled'; e.pending = false;
+      if (m.reviewEventId) r.lastReviewEvent = Math.max(r.lastReviewEvent, m.reviewEventId);
+      store.save(); scheduleAck(); render();
+      break;
+    }
+
+    case 'msg_flagged': { // 仅标记：正文保留，加风险标
+      const r = rooms.get(m.roomId); if (!r) break;
+      const e = r.bySeq.get(m.seq);
+      if (e) { e.review = 'flagged'; e.flags = m.flags; e.reason = m.reason; e.ruleVersion = m.ruleVersion; }
+      if (m.reviewEventId) r.lastReviewEvent = Math.max(r.lastReviewEvent, m.reviewEventId);
+      store.save(); scheduleAck(); render();
+      break;
+    }
+
+    case 'ack': {
       const r = rooms.get(m.roomId); if (!r) break;
       const p = r.pending.get(m.clientMsgId);
       if (p) p.acked = true;
       const own = r.msgs.find((x) => x.clientMsgId === m.clientMsgId);
-      if (own) { own.pending = false; own.seq = m.seq; }
+      if (own) { own.pending = false; own.seq = m.seq; r.bySeq.set(m.seq, own); sortMsgs(r); }
       render();
       break;
     }
+
+    case 'review_policy': {
+      const r = rooms.get(m.roomId);
+      if (r) { r.mode = m.mode; render(); }
+      break;
+    }
+
+    case 'appeal_update': {
+      // 更新被申诉消息上的申诉状态徽标
+      const r = rooms.get(m.appeal.roomId);
+      const e = r?.bySeq.get(m.appeal.seq);
+      if (e) { e.appealStatus = m.appeal.status; render(); }
+      if ($('console').classList.contains('open')) refreshConsole();
+      break;
+    }
+
     case 'sync_done':
       if (m.hasMore) send({ type: 'sync', roomId: m.roomId, lastSeq: m.lastSeq });
       break;
@@ -184,6 +336,17 @@ function handle(m) {
     case 'members':
       if (m.roomId === currentRoom) renderMembers(m.members);
       break;
+
+    // —— 审核台响应 ——
+    case 'review_queue': renderQueue(m); break;
+    case 'review_decided': refreshConsole(); break;
+    case 'review_enqueued': refreshConsole(); break;
+    case 'appeals': renderAppeals(m); break;
+    case 'rules': renderRules(m); break;
+    case 'review_rule': refreshConsole(); break;
+    case 'review_recheck': showRecheck(m); break;
+    case 'review_log': renderLog(m); break;
+
     case 'error':
       sys(currentRoom, `错误 [${m.code}] ${m.message}`);
       break;
@@ -195,7 +358,11 @@ function scheduleAck() {
   if (ackTimer) return;
   ackTimer = setTimeout(() => {
     ackTimer = null;
-    for (const [id, r] of rooms) if (r.lastSeenSeq > 0) send({ type: 'ack', roomId: id, seq: r.lastSeenSeq });
+    for (const [id, r] of rooms) {
+      if (r.lastSeenSeq > 0) {
+        send({ type: 'ack', roomId: id, seq: r.lastSeenSeq, reviewSeq: r.lastReviewEvent || 0 });
+      }
+    }
   }, 500);
 }
 
@@ -230,29 +397,63 @@ function renderRooms() {
   }
 }
 
+const MODE_LABEL = { pre: '先审后发', post: '先发后撤', mark: '仅标记风险' };
+
 function render() {
   const r = rooms.get(currentRoom);
   $('composer').classList.toggle('hidden', !r);
   $('members').classList.toggle('hidden', !r);
+  $('chatbar').style.display = r ? 'flex' : 'none';
   if (!r) return;
+  $('modeTag').textContent = r.mode ? `审核模式：${MODE_LABEL[r.mode] || r.mode}` : '审核未启用';
+  const admin = r.role === 'admin';
+  $('modePre').classList.toggle('hidden', !admin);
+  $('modePost').classList.toggle('hidden', !admin);
+  $('modeMark').classList.toggle('hidden', !admin);
+  $('consoleBtn').classList.toggle('hidden', !admin);
+
   const box = $('messages');
   box.innerHTML = r.msgs.map((m) => {
     if (m.sys) return `<div class="sys">${escapeHtml(m.sys)}</div>`;
+    const tags = {
+      pending: '<span class="rv-tag pending">审核中</span>',
+      blocked: '<span class="rv-tag blocked">未通过审核</span>',
+      recalled: '<span class="rv-tag recalled">已撤回</span>',
+      flagged: '<span class="rv-tag flagged">风险标记</span>',
+    }[m.review] || '';
     const tick = m.mine ? `<span class="tick">${m.pending ? '…' : '✓'}</span>` : '';
-    return `<div class="msg ${m.mine ? 'mine' : ''}">
-      <div class="meta">${escapeHtml(m.fromName || '')} · #${m.seq} ${tick}</div>
-      <div>${escapeHtml(m.content)}</div></div>`;
+    let body;
+    if (m.review === 'recalled') body = '该消息因疑似违规被撤回';
+    else if (m.review === 'blocked') body = m.content && m.mine ? escapeHtml(m.content) : '该消息未通过审核';
+    else body = escapeHtml(m.content || (m.review === 'pending' ? '（内容审核中，暂不展示）' : ''));
+    const reason = m.reason && (m.mine || m.review !== 'blocked')
+      ? `<div class="sub" style="font-size:11px;opacity:.7">${escapeHtml(m.reason)}</div>` : '';
+    const appealTag = m.appealStatus ? `<span class="rv-tag flagged">申诉：${({open:'待裁决',approved:'已通过',rejected:'已驳回'})[m.appealStatus]}</span>` : '';
+    // 申诉入口：发送者本人、被处置（撤回/拦截/标记）、且无进行中申诉
+    const canAppeal = m.mine && ['recalled', 'blocked', 'flagged'].includes(m.review) && m.appealStatus !== 'open';
+    const appealBtn = canAppeal
+      ? `<div class="rv-actions"><button data-act="appeal" data-seq="${m.seq}">申诉</button></div>` : '';
+    return `<div class="msg ${m.mine ? 'mine' : ''} ${m.review}">
+      <div class="meta">${escapeHtml(m.fromName || '')} · #${Number.isInteger(m.seq) ? m.seq : '…'} ${tick}${tags}${appealTag}</div>
+      <div>${body}</div>${reason}${appealBtn}
+    </div>`;
   }).join('');
   box.scrollTop = box.scrollHeight;
+  box.querySelectorAll('button[data-act="appeal"]').forEach((b) => {
+    b.onclick = () => {
+      const reason = prompt('申诉理由（将提交给管理员复核）', '误判，申请恢复');
+      if (reason) send({ type: 'appeal_submit', roomId: currentRoom, seq: Number(b.dataset.seq), reason });
+    };
+  });
+
   const muted = r.mutedUntil > Date.now();
   $('msgInput').placeholder = muted ? `你已被禁言至 ${new Date(r.mutedUntil).toLocaleTimeString()}` : '发送消息…';
   $('msgInput').disabled = muted;
 }
 
-// 把 members 响应接进渲染
 function renderMembers(list) {
   const r = rooms.get(currentRoom); if (!r) return;
-  $('members').innerHTML = '<b>成员</b>' + list.map((m) => {
+  $('members').innerHTML = '<b>成员</b>' + list.members.map((m) => {
     const muted = m.mutedUntil > Date.now();
     const adminBtns = r.role === 'admin' && m.userId !== me.userId && m.role !== 'admin'
       ? (muted ? `<button data-act="unmute" data-uid="${m.userId}">解禁</button>`
@@ -275,8 +476,124 @@ function renderMembers(list) {
   });
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// ---------------------------------------------------------------- 审核台
+
+function openConsole(tab) {
+  $('console').classList.add('open');
+  consoleTab = tab || consoleTab;
+  document.querySelectorAll('#console .tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === consoleTab));
+  ['queue', 'appeals', 'rules', 'log'].forEach((t) => $('pane-' + t).classList.toggle('hidden', t !== consoleTab));
+  refreshConsole();
+}
+function refreshConsole() {
+  if (!$('console').classList.contains('open') || !currentRoom) return;
+  if (consoleTab === 'queue') send({ type: 'review_queue', roomId: currentRoom });
+  if (consoleTab === 'appeals') send({ type: 'appeals_list', roomId: currentRoom, status: 'open' });
+  if (consoleTab === 'rules') send({ type: 'rules_list' });
+  if (consoleTab === 'log') send({ type: 'review_log', roomId: currentRoom });
+}
+setInterval(() => { if ($('console').classList.contains('open')) refreshConsole(); }, 5000);
+
+function decide(seq, action, reason) {
+  send({ type: 'review_decide', roomId: currentRoom, seq, action, reason: reason || null });
+}
+
+function renderQueue(m) {
+  const pane = $('pane-queue');
+  if (!m.items.length) { pane.innerHTML = '<div class="sub">暂无待审消息</div>'; return; }
+  pane.innerHTML = m.items.map((i) => {
+    const btns = [];
+    if (i.reviewStatus === 'pending') {
+      btns.push(`<button class="small" data-d="release" data-seq="${i.seq}">放行</button>`);
+      btns.push(`<button class="small warn" data-d="block" data-seq="${i.seq}">拦截</button>`);
+    }
+    if (i.reviewStatus === 'released') {
+      btns.push(`<button class="small warn" data-d="recall" data-seq="${i.seq}">撤回</button>`);
+    }
+    if (i.reviewStatus === 'recalled' || i.reviewStatus === 'blocked') {
+      btns.push(`<button class="small" data-d="restore" data-seq="${i.seq}">恢复</button>`);
+    }
+    btns.push(`<button class="small ghost" data-d="dismiss" data-seq="${i.seq}">忽略</button>`);
+    btns.push(`<button class="small ghost" data-d="recheck" data-seq="${i.seq}">按新规则重检</button>`);
+    const flags = (i.reviewFlags || []).map((f) => `<span class="flag">${escapeHtml(f)}</span>`).join(' ');
+    return `<div class="card">
+      <div class="sub">#${i.seq} · ${escapeHtml(i.fromName)} · ${new Date(i.ts).toLocaleTimeString()} · 状态 ${i.reviewStatus} · ${i.source === 'manual' ? '人工加队' : '自动'}</div>
+      <blockquote>${escapeHtml(i.content)}</blockquote>
+      <div>${flags} ${i.reviewReason ? `<span class="sub">${escapeHtml(i.reviewReason)}</span>` : ''} ${i.reviewRuleVersion ? `<span class="sub">规则v${i.reviewRuleVersion}</span>` : ''}</div>
+      <div class="row">${btns.join('')}</div>
+    </div>`;
+  }).join('');
+  pane.querySelectorAll('button[data-d]').forEach((b) => {
+    b.onclick = () => {
+      const d = b.dataset.d, seq = Number(b.dataset.seq);
+      if (d === 'recheck') { send({ type: 'review_recheck', roomId: currentRoom, seq }); return; }
+      let reason = null;
+      if (d === 'block') reason = prompt('拦截理由（发送者可见）', '确认违规') || null;
+      decide(seq, d, reason);
+    };
+  });
+}
+
+function renderAppeals(m) {
+  const pane = $('pane-appeals');
+  if (!m.appeals.length) { pane.innerHTML = '<div class="sub">暂无待裁决申诉</div>'; return; }
+  pane.innerHTML = m.appeals.map((a) => `<div class="card">
+    <div class="sub">#${a.seq} · 申诉人 ${escapeHtml(a.userId)} · ${new Date(a.createdAt).toLocaleString()} · ${a.status}</div>
+    <blockquote>${escapeHtml(a.reason)}</blockquote>
+    ${a.status === 'open' ? `<div class="row">
+      <button class="small" data-a="approved" data-id="${a.id}" data-seq="${a.seq}">申诉成立，恢复消息</button>
+      <button class="small warn" data-a="rejected" data-id="${a.id}">驳回</button>
+    </div>` : `<div class="sub">裁决：${escapeHtml(a.decisionNote || '')}</div>`}
+  </div>`).join('');
+  pane.querySelectorAll('button[data-a]').forEach((b) => {
+    b.onclick = () => {
+      const note = prompt('裁决备注（可选）', b.dataset.a === 'approved' ? '误判恢复' : '维持处置') || '';
+      send({ type: 'appeal_decide', appealId: b.dataset.id, decision: b.dataset.a, note });
+    };
+  });
+}
+
+function renderRules(m) {
+  const pane = $('pane-rules');
+  const active = m.active;
+  pane.innerHTML = `
+    <div class="card">
+      <b>发布新规则版本</b>
+      <div class="sub">发布后旧版本立即失活；历史消息保留命中时的版本号，可追溯误判。</div>
+      <textarea id="ruleWords" rows="2" style="width:100%;margin-top:6px" placeholder="敏感词，逗号分隔">${(active?.words || []).map(escapeHtml).join(',')}</textarea>
+      <div class="row">
+        <label class="sub">窗口(ms)<input id="ruleWin" type="number" value="${active?.freqWindowMs || 10000}" style="width:90px"></label>
+        <label class="sub">阈值(条)<input id="ruleMax" type="number" value="${active?.freqMaxCount || 8}" style="width:60px"></label>
+        <input id="ruleNote" placeholder="版本说明" style="flex:1;min-width:80px">
+        <button id="rulePublish">发布新版本</button>
+      </div>
+    </div>
+    ${m.rules.map((r) => `<div class="card">
+      <div class="sub"><b>v${r.version}</b> ${r.active ? '<span class="flag">生效中</span>' : '已归档'} · ${new Date(r.createdAt).toLocaleString()}</div>
+      <div>敏感词：${r.words.length ? r.words.map((w) => `<span class="flag">${escapeHtml(w)}</span>`).join(' ') : '（无）'}</div>
+      <div class="sub">频率：${r.freqWindowMs}ms 内 ${r.freqMaxCount} 条 · ${escapeHtml(r.note || '')}</div>
+    </div>`).join('')}`;
+  $('rulePublish').onclick = () => {
+    const words = $('ruleWords').value.split(/[,，\n]/).map((s) => s.trim()).filter(Boolean);
+    send({
+      type: 'rule_publish', words,
+      freqWindowMs: Number($('ruleWin').value), freqMaxCount: Number($('ruleMax').value),
+      note: $('ruleNote').value,
+    });
+  };
+}
+
+function renderLog(m) {
+  const pane = $('pane-log');
+  if (!m.entries.length) { pane.innerHTML = '<div class="sub">暂无操作日志</div>'; return; }
+  pane.innerHTML = m.entries.map((e) => `<div class="card">
+    <div class="sub">${new Date(e.ts).toLocaleString()} · ${escapeHtml(e.actorName || e.actorId)} · <b>${e.action}</b> · ${e.targetType} ${escapeHtml(e.targetId)}</div>
+    <div class="sub">${escapeHtml(JSON.stringify(e.detail))}</div>
+  </div>`).join('');
+}
+
+function showRecheck(m) {
+  alert(`重检结果（规则 v${m.ruleVersion}）\n命中：${m.hit ? '是' : '否'}${m.degraded ? '（检测服务降级）' : ''}\n标记：${(m.flags || []).join('、') || '无'}\n原因：${m.reason || '无'}\n原判定规则：v${m.storedRuleVersion}`);
 }
 
 // ---------------------------------------------------------------- 事件绑定
@@ -285,10 +602,9 @@ $('loginForm').onsubmit = async (e) => {
   e.preventDefault();
   const name = $('nameInput').value.trim(); if (!name) return;
   me = await login(name);
-  // 恢复房间进度
   const saved = store.load();
   for (const [id, info] of Object.entries(saved)) {
-    rooms.set(id, { name: info.name, msgs: [], pending: new Map(), lastSeenSeq: info.lastSeenSeq || 0 });
+    rooms.set(id, { name: info.name, msgs: [], bySeq: new Map(), pending: new Map(), lastSeenSeq: info.lastSeenSeq || 0, lastReviewEvent: info.lastReviewEvent || 0 });
   }
   $('loginForm').classList.add('hidden');
   $('roomPanel').classList.remove('hidden');
@@ -314,11 +630,22 @@ $('composer').onsubmit = (e) => {
   const cid = crypto.randomUUID();
   const r = rooms.get(currentRoom);
   r.pending.set(cid, { content, sentAt: Date.now(), acked: false });
-  r.msgs.push({ mine: true, fromName: me.name, content, seq: '…', pending: true, clientMsgId: cid });
+  // 乐观消息先上屏（pre 模式下审核中占位帧到达后合并同一条）
+  r.msgs.push({ mine: true, from: me.userId, fromName: me.name, content, seq: null, pending: true, clientMsgId: cid, review: 'released' });
   send({ type: 'msg', roomId: currentRoom, clientMsgId: cid, content });
   $('msgInput').value = '';
   render();
 };
+
+for (const mode of ['pre', 'post', 'mark']) {
+  $('mode' + mode[0].toUpperCase() + mode.slice(1)).onclick = () =>
+    send({ type: 'review_policy', roomId: currentRoom, mode });
+}
+$('consoleBtn').onclick = () => openConsole('queue');
+$('consoleClose').onclick = () => $('console').classList.remove('open');
+document.querySelectorAll('#console .tabs button').forEach((b) => {
+  b.onclick = () => openConsole(b.dataset.tab);
+});
 </script>
 </body>
 </html>
